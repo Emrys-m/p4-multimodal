@@ -1,0 +1,21 @@
+三种模态路径总结
+====================
+
+一、IPv4
+证据文件：class1/evidence/ipv4-pingall.png
+经过交换机：h1 - s1 - s11 - s12 - s2 - h2
+结论：pingall 0% dropped，双向可达，路径与 topology 一致。
+
+二、IPv6
+证据文件：class1/evidence/ipv6-ping6.png、class1/evidence/s1-log.txt
+经过交换机：h1 - s1 - s21 - s22 - s2 - h2
+结论：ping6 0% packet loss，ttl=60，双向可达。s1.log 中 ff02::2 组播因未配表项被 drop，属正常现象，不影响单播路径。
+
+三、Source Routing
+证据文件：class1/evidence/sr-s1-eth4_out.pcap、class1/evidence/sr-s31-eth1_in.pcap、class1/evidence/sr-s31-eth2_out.pcap、class1/evidence/sr-s2-eth1_out.pcap
+端口栈：正向 4 2 2 1；反向 4 1 1 1。
+经过交换机：s1-eth4 -> s31-eth1 -> s31-eth2 -> s32-eth1 -> s32-eth2 -> s2-eth4 -> s2-eth1
+结论：tcpdump 显示 s1-eth4_out.pcap 的 EtherType 为 0x1234，最后一跳 s2-eth1_out 恢复为 0x0800。SR 使用正确绿色路径端口栈，双向通过。
+
+四、总体结论
+三种模态路径互不相同，均可复现，baseline 可作为后续实验的比较基准。
