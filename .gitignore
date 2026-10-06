@@ -1,0 +1,15 @@
+build/
+logs/
+pcaps/
+*.pcap
+*.log
+__pycache__/
+*.pyc
+*.pyo
+
+.vscode/
+
+.idea/
+*.o
+*.so
+*.a
