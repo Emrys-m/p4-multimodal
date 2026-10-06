@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Verified three-path baseline controller used as the student starter.
+
+The baseline installs ordinary IPv4 and IPv6 forwarding only. Follow the
+milestones in STUDENT_TODO.md to add multicast scheduling, gateway roles,
+fault injection and counter reads. Keep this file runnable after every step.
+"""
+
 import argparse
 import grpc
 import os
@@ -14,6 +21,7 @@ import p4runtime_lib.bmv2
 from p4runtime_lib.error_utils import printGrpcError
 from p4runtime_lib.switch import ShutdownAllSwitchConnections
 import p4runtime_lib.helper
+from p4.v1 import p4runtime_pb2
 
 def writeArp_matchRules(p4info_helper, sw, match_fields_1, match_fields_2, action_params):
 
@@ -51,7 +59,34 @@ def writeIpv6_lpmRules(p4info_helper, sw, match_fields, action_params):
         action_params=action_params
         )
     sw.WriteTableEntry(table_entry)
+def writeMulticastGroup(p4info_helper, sw, group_id, replicas):
+    """replicas: list of (egress_port, instance) tuples"""
+    req = p4runtime_pb2.WriteRequest()
+    req.device_id = sw.device_id
+    req.election_id.low = 1
+    req.election_id.high = 0
 
+    update = req.updates.add()
+    update.type = p4runtime_pb2.Update.INSERT
+    mcast_entry = update.entity.packet_replication_engine_entry.multicast_group_entry
+    mcast_entry.multicast_group_id = group_id
+    for (port, instance) in replicas:
+        replica = mcast_entry.replicas.add()
+        replica.egress_port = port
+        replica.instance = instance
+
+    sw.client_stub.Write(req)
+    print("Installed multicast group %d on %s" % (group_id, sw.name))
+
+
+def writePolymorphicSchedule(p4info_helper, sw, match_fields, action_params):
+    table_entry = p4info_helper.buildTableEntry(
+        table_name="MyIngress.polymorphic_schedule",
+        match_fields=match_fields,
+        action_name="MyIngress.start_polymorphic",
+        action_params=action_params
+    )
+    sw.WriteTableEntry(table_entry)
 
 def main(p4info_file_path, bmv2_file_path):
     # Instantiate a P4Runtime helper from the p4info file
@@ -167,6 +202,41 @@ def main(p4info_file_path, bmv2_file_path):
         writeIpv6_lpmRules(p4info_helper, s22, ["fe80::1234", 128], {"dstAddr": "08:00:00:00:11:00", "port": 1})
         writeIpv6_lpmRules(p4info_helper, s21, ["fe80::1234", 128], {"dstAddr": "08:00:00:00:01:00", "port": 1})
         writeIpv6_lpmRules(p4info_helper, s1, ["fe80::1234", 128], {"dstAddr": "08:00:00:00:01:01", "port": 1})
+
+        # STUDENT TODO M3-M5
+                # 1. 配置 multicast group 10
+        writeMulticastGroup(p4info_helper, s1, group_id=10,
+                            replicas=[(2, 1), (3, 2), (4, 3)])
+        writeMulticastGroup(p4info_helper, s2, group_id=10,
+                            replicas=[(2, 1), (3, 2), (4, 3)])
+
+        # 2. S1 正向：h1 -> h2
+        writePolymorphicSchedule(p4info_helper, s1,
+            match_fields={
+                "standard_metadata.ingress_port": 1,
+                "hdr.ipv4.dstAddr": "10.0.2.2",
+                "hdr.udp.dstPort": 5000,
+            },
+            action_params={"dir": 0})
+
+        # 3. S2 反向：h2 -> h1
+        writePolymorphicSchedule(p4info_helper, s2,
+            match_fields={
+                "standard_metadata.ingress_port": 1,
+                "hdr.ipv4.dstAddr": "10.0.1.1",
+                "hdr.udp.dstPort": 5000,
+            },
+            action_params={"dir": 1})
+        # 1. Add one helper that writes MyIngress.polymorphic_schedule.
+        # 2. Add one helper that creates multicast group 10 with ports 2/3/4.
+        # 3. Install symmetric source/destination gateway roles on s1 and s2.
+        # 4. Add fault-table entries only after the no-fault path is correct.
+        #
+        # Suggested call shape (names are a contract, implementation is yours):
+        # writeMulticastGroup(p4info_helper, s1, group_id=10,
+        #                     replicas=[(2, 1), (3, 2), (4, 3)])
+        # writeMulticastGroup(p4info_helper, s2, group_id=10,
+        #                     replicas=[(2, 1), (3, 2), (4, 3)])
         
 
     except KeyboardInterrupt:

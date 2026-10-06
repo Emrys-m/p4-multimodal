@@ -1,0 +1,52 @@
+第二次实验：模态调度与异构封装 数据包总结
+============================================
+
+一、发送端
+发送主机：h1
+发送命令：python3 send-poly.py 10.0.2.2 class2-test
+发送数量：1 份原始 IPv4/UDP 实验报文
+传输层：UDP，目的端口 5000
+protected_data：16 字节，内容 "class2-test" 补零
+POLY_SEND 输出：
+  src=10.0.1.1 dst=10.0.2.2 dport=5000
+  protected_hex=636c617373322d74657374000000000000
+
+二、源网关复制与模态调度
+源网关：S1
+multicast group：group 10
+副本映射：
+  出口端口 2，副本编号 1，modality_id=1，外层封装 IPv4，protocol=253
+  出口端口 3，副本编号 2，modality_id=2，外层封装 IPv6，nextHdr=253
+  出口端口 4，副本编号 3，modality_id=3，外层封装 Source Routing，EtherType=0x1234
+序号产生位置：Ingress，复制前生成，三份副本共享同一 sequence_number。
+CRC 产生位置：Ingress，复制前计算 source_crc32。
+
+三、三条路径的 pcap 证据
+1. IPv4 模态（端口 2）
+   证据文件：class2/evidence/s1-eth2_out.pcap
+   报文特征：ethertype IPv4 (0x0800)，ip-proto-253，src 10.0.1.1 > dst 10.0.2.2
+   结论：副本从 S1 端口 2 进入 IPv4 路径。
+
+2. IPv6 模态（端口 3）
+   证据文件：class2/evidence/s1-eth3_out.pcap
+   报文特征：ethertype IPv6 (0x86dd)，ip-proto-253，src :: > dst ::
+   结论：副本从 S1 端口 3 进入 IPv6 路径。
+
+3. Source Routing 模态（端口 4）
+   证据文件：class2/evidence/s1-eth4_out.pcap
+   报文特征：ethertype Unknown (0x1234)，端口栈正向 4 2 2 1
+   结论：副本从 S1 端口 4 进入 Source Routing 绿色路径。
+
+四、控制器配置
+控制器输出：
+  Installed multicast group 10 on s1
+  Installed multicast group 10 on s2
+说明：S1 和 S2 均已安装 group 10，支持正向和反向复制。
+
+五、原有功能检查
+IPv4 pingall：0% dropped (2/2 received)
+IPv6 ping6：3 transmitted, 3 received, 0% packet loss, ttl=60
+ARP、SourceRouting 功能正常。
+
+六、总体结论
+一份输入在源网关 S1 形成三份相关副本，序号相同、模态编号不同，分别进入 IPv4、IPv6、SourceRouting 三条路径，符合第二次实验要求。

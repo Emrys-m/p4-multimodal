@@ -1,15 +1,13 @@
 build/
 logs/
 pcaps/
-*.pcap
-*.log
 __pycache__/
 *.pyc
 *.pyo
+*.pcap
+*.pcapng
+.DS_Store
 
-.vscode/
-
-.idea/
-*.o
-*.so
-*.a
+# 只把为验收挑选并整理过的材料放入 evidence/。
+!evidence/
+!evidence/**
