@@ -19,13 +19,9 @@ const bit<16> POLY_UDP_PORT      = 5000;
 
 #define MAX_HOPS 9
 
-/*************************************************************************
-*********************** H E A D E R S  ***********************************
-*************************************************************************/
-
-typedef bit<9>  egressSpec_t;
-typedef bit<48> macAddr_t;
-typedef bit<32> ip4Addr_t;
+typedef bit<9>   egressSpec_t;
+typedef bit<48>  macAddr_t;
+typedef bit<32>  ip4Addr_t;
 typedef bit<128> ip6Addr_t;
 
 header ethernet_t {
@@ -113,6 +109,14 @@ header udp_t {
 
 struct metadata {
     ip4Addr_t dst_ipv4;
+
+    bit<32> sequence_number;
+    bit<32> slot;
+    bit<32> observed_crc;
+    bit<8>  modality_id;
+    bit<1>  is_source_gateway;
+    bit<1>  is_destination_gateway;
+    bit<1>  output_now;
 }
 
 struct headers {
@@ -152,10 +156,10 @@ parser MyParser(packet_in packet,
         }
     }
 
-    state parse_srcRouting {
+        state parse_srcRouting {
         packet.extract(hdr.srcRoutes.next);
         transition select(hdr.srcRoutes.last.bos) {
-            1:        parse_ipv4;
+            1:        parse_polyShim;
             default:  parse_srcRouting;
         }
     }
@@ -219,32 +223,100 @@ parser MyParser(packet_in packet,
     }
 }
 
-/*************************************************************************
-************   C H E C K S U M    V E R I F I C A T I O N   *************
-*************************************************************************/
-
 control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
     apply { }
 }
 
 /*************************************************************************
-**************  I N G R E S S   P R O C E S S I N G   *******************
+*********************** I N G R E S S ***********************************
 *************************************************************************/
 
 control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
 
+    #define STATE_SLOTS 1024
+    #define MODE_COUNTER_SLOTS 5
+
+    register<bit<32>>(STATE_SLOTS) seq_tag;
+    register<bit<32>>(STATE_SLOTS) crc_candidate_1;
+    register<bit<32>>(STATE_SLOTS) crc_candidate_2;
+    register<bit<8>>(STATE_SLOTS)  mode_candidate_1;
+    register<bit<8>>(STATE_SLOTS)  mode_candidate_2;
+    register<bit<8>>(STATE_SLOTS)  seen_modes;
+    register<bit<2>>(STATE_SLOTS)  candidate_counts;
+    register<bit<1>>(STATE_SLOTS)  decided;
+    register<bit<32>>(STATE_SLOTS) decided_crc;
+        register<bit<32>>(1) seq_counter;
+
+    action corrupt_data(bit<32> mask) {
+        hdr.protected_data.value[31:0] = hdr.protected_data.value[31:0] ^ mask;
+    }
+
+	action drop() {
+        mark_to_drop(standard_metadata);
+    }
+
+    table fault_table {
+        key = {
+            hdr.polyShim.modality_id:     exact;
+            hdr.polyShim.sequence_number: exact;
+        }
+        actions = {
+            corrupt_data;
+            drop;
+            NoAction;
+        }
+        size = 16;
+        default_action = NoAction;
+    }
+    
+        action set_destination_gateway() {
+        meta.is_destination_gateway = 1;
+    }
+
+    table destination_gateway {
+        key = {
+            standard_metadata.ingress_port: exact;
+        }
+        actions = {
+            set_destination_gateway;
+            NoAction;
+        }
+        size = 8;
+        default_action = NoAction;
+    }
+
+    counter(MODE_COUNTER_SLOTS, CounterType.packets) good_count;
+    counter(MODE_COUNTER_SLOTS, CounterType.packets) bad_count;
+    counter(1, CounterType.packets) no_majority_count;
+
     action start_polymorphic(bit<8> dir) {
         hdr.inner_ipv4 = hdr.ipv4;
         hdr.ipv4.setInvalid();
 
+                bit<32> seq;
+        seq_counter.read(seq, 0);
+        seq = seq + 1;
+        seq_counter.write(0, seq);
+        meta.sequence_number = seq;
+
+        meta.observed_crc =
+            (bit<32>)hdr.inner_ipv4.srcAddr ^
+            (bit<32>)hdr.inner_ipv4.dstAddr ^
+            (bit<32>)hdr.udp.srcPort ^
+            (bit<32>)hdr.udp.dstPort ^
+            (bit<32>)(hdr.protected_data.value[127:96]) ^
+            (bit<32>)(hdr.protected_data.value[95:64]) ^
+            (bit<32>)(hdr.protected_data.value[63:32]) ^
+            (bit<32>)(hdr.protected_data.value[31:0]);
+
         hdr.polyShim.setValid();
         hdr.polyShim.magic            = POLY_MAGIC;
         hdr.polyShim.direction        = dir;
-        hdr.polyShim.sequence_number  = 1;
+        hdr.polyShim.sequence_number  = meta.sequence_number;
         hdr.polyShim.modality_id      = 0;
-        hdr.polyShim.source_crc32     = 0;
+        hdr.polyShim.source_crc32     = meta.observed_crc;
         hdr.polyShim.inner_ether_type = 0x0800;
 
         standard_metadata.mcast_grp = 10;
@@ -264,9 +336,7 @@ control MyIngress(inout headers hdr,
         default_action = NoAction;
     }
 
-    action drop() {
-        mark_to_drop(standard_metadata);
-    }
+    
 
     action srcRoute_nhop() {
         standard_metadata.egress_spec = (bit<9>)hdr.srcRoutes[0].port;
@@ -346,14 +416,157 @@ control MyIngress(inout headers hdr,
         const default_action = drop();
     }
 
-    apply {
-        if (hdr.ipv4.isValid() && hdr.udp.isValid() && hdr.udp.dstPort == POLY_UDP_PORT) {
-            polymorphic_schedule.apply();
+    // ===== 第三次实验：目的网关 2/3 裁决 =====
+    action adjudicate() {
+        meta.slot = hdr.polyShim.sequence_number & 32w1023;
+        meta.modality_id = hdr.polyShim.modality_id;
+        bit<8> modality_mask = 8w1 << meta.modality_id;
+
+        meta.observed_crc =
+            (bit<32>)hdr.inner_ipv4.srcAddr ^
+            (bit<32>)hdr.inner_ipv4.dstAddr ^
+            (bit<32>)hdr.udp.srcPort ^
+            (bit<32>)hdr.udp.dstPort ^
+            (bit<32>)(hdr.protected_data.value[127:96]) ^
+            (bit<32>)(hdr.protected_data.value[95:64]) ^
+            (bit<32>)(hdr.protected_data.value[63:32]) ^
+            (bit<32>)(hdr.protected_data.value[31:0]);
+
+        bit<32> old_tag;
+        bit<8>  seen;
+        bit<2>  cnt;
+        bit<1>  is_decided;
+        bit<32> c1;
+        bit<32> c2;
+        bit<8>  m1;
+        bit<8>  m2;
+        bit<32> winner_crc;
+
+        seq_tag.read(old_tag, meta.slot);
+
+        if (old_tag != hdr.polyShim.sequence_number) {
+            seq_tag.write(meta.slot, hdr.polyShim.sequence_number);
+            crc_candidate_1.write(meta.slot, 0);
+            crc_candidate_2.write(meta.slot, 0);
+            mode_candidate_1.write(meta.slot, 0);
+            mode_candidate_2.write(meta.slot, 0);
+            seen_modes.write(meta.slot, 0);
+            candidate_counts.write(meta.slot, 0);
+            decided.write(meta.slot, 0);
+            decided_crc.write(meta.slot, 0);
         }
-        if (hdr.srcRoutes[0].isValid()) {
-            if (hdr.srcRoutes[0].bos == 1) {
-                srcRoute_finish();
+
+        seen_modes.read(seen, meta.slot);
+        if ((seen & modality_mask) != 0) {
+            mark_to_drop(standard_metadata);
+            return;
+        }
+        seen_modes.write(meta.slot, seen | modality_mask);
+
+        decided.read(is_decided, meta.slot);
+        if (is_decided == 1) {
+            candidate_counts.read(cnt, meta.slot);
+            if (cnt == 2) {
+                decided_crc.read(winner_crc, meta.slot);
+                if (meta.observed_crc == winner_crc) {
+                    good_count.count((bit<32>)meta.modality_id);
+                } else {
+                    bad_count.count((bit<32>)meta.modality_id);
+                }
             }
+            mark_to_drop(standard_metadata);
+            return;
+        }
+
+        candidate_counts.read(cnt, meta.slot);
+
+        if (cnt == 0) {
+            crc_candidate_1.write(meta.slot, meta.observed_crc);
+            mode_candidate_1.write(meta.slot, meta.modality_id);
+            candidate_counts.write(meta.slot, 1);
+            mark_to_drop(standard_metadata);
+            return;
+        }
+
+        if (cnt == 1) {
+            crc_candidate_1.read(c1, meta.slot);
+            mode_candidate_1.read(m1, meta.slot);
+            if (meta.observed_crc == c1) {
+                decided.write(meta.slot, 1);
+                decided_crc.write(meta.slot, c1);
+                candidate_counts.write(meta.slot, 2);
+                good_count.count((bit<32>)m1);
+                good_count.count((bit<32>)meta.modality_id);
+                meta.output_now = 1;
+            } else {
+                crc_candidate_2.write(meta.slot, meta.observed_crc);
+                mode_candidate_2.write(meta.slot, meta.modality_id);
+                candidate_counts.write(meta.slot, 2);
+                mark_to_drop(standard_metadata);
+            }
+            return;
+        }
+
+        if (cnt == 2) {
+            crc_candidate_1.read(c1, meta.slot);
+            crc_candidate_2.read(c2, meta.slot);
+            mode_candidate_1.read(m1, meta.slot);
+            mode_candidate_2.read(m2, meta.slot);
+            if (meta.observed_crc == c1) {
+                decided.write(meta.slot, 1);
+                decided_crc.write(meta.slot, c1);
+                good_count.count((bit<32>)m1);
+                bad_count.count((bit<32>)m2);
+                good_count.count((bit<32>)meta.modality_id);
+                meta.output_now = 1;
+            } else if (meta.observed_crc == c2) {
+                decided.write(meta.slot, 1);
+                decided_crc.write(meta.slot, c2);
+                bad_count.count((bit<32>)m1);
+                good_count.count((bit<32>)m2);
+                good_count.count((bit<32>)meta.modality_id);
+                meta.output_now = 1;
+            } else {
+                decided.write(meta.slot, 1);
+                candidate_counts.write(meta.slot, 3);
+                no_majority_count.count(0);
+                mark_to_drop(standard_metadata);
+            }
+        }
+    }
+    // ===== 裁决结束 =====
+
+    apply {
+        if (hdr.polyShim.isValid()) {
+            fault_table.apply();
+        }
+        if (standard_metadata.egress_spec == 511) {
+            exit;
+        }
+
+        // 源网关：主机包，触发调度复制
+        if (!hdr.polyShim.isValid()
+            && hdr.ipv4.isValid()
+            && hdr.udp.isValid()
+            && hdr.udp.dstPort == POLY_UDP_PORT) {
+            polymorphic_schedule.apply();
+            exit;
+        }
+
+        // 目的网关：从路径端口收到副本
+        if (hdr.polyShim.isValid() && standard_metadata.ingress_port >= 2) {
+            destination_gateway.apply();
+        }
+        if (meta.is_destination_gateway == 1) {
+            adjudicate();
+            if (meta.output_now == 1) {
+                standard_metadata.egress_spec = 1;
+            }
+            exit;
+        }
+
+        // 中间交换机：SR 转发
+        if (hdr.srcRoutes[0].isValid() && hdr.srcRoutes[0].bos == 0) {
             srcRoute_nhop();
             if (hdr.ipv4.isValid()) {
                 update_ttl();
@@ -379,34 +592,96 @@ control MyEgress(inout headers hdr,
                  inout metadata meta,
                  inout standard_metadata_t standard_metadata) {
     apply {
-        if (hdr.polyShim.isValid()) {
+                if (meta.output_now == 1) {
+            // 目的网关多数形成：透明还原
+            bit<8> dir = hdr.polyShim.direction;
+
+            hdr.ipv4.setInvalid();
+            hdr.ipv6.setInvalid();
+            hdr.srcRoutes[0].setInvalid();
+            hdr.polyShim.setInvalid();
+
+            hdr.inner_ipv4.setValid();
+            hdr.udp.setValid();
+            hdr.protected_data.setValid();
+
+            hdr.ethernet.etherType = TYPE_IPV4;
+            if (dir == 0) {
+                hdr.ethernet.dstAddr = 0x080000000202;   // h2
+            } else {
+                hdr.ethernet.dstAddr = 0x080000000101;   // h1
+            }
+            standard_metadata.egress_spec = 1;
+        }
+        else if (hdr.srcRoutes[0].isValid()) {
+            // 中间交换机转发 SR，不做任何封装
+        }
+                                else if (hdr.polyShim.isValid() && standard_metadata.mcast_grp == 10) {
             if (standard_metadata.egress_port == 2) {
-                // 端口 2：外层 IPv4，protocol=253
                 hdr.ethernet.etherType = 0x0800;
-                hdr.ethernet.dstAddr   = 0x080000001100; // s11 的 MAC
+                 if (hdr.polyShim.direction == 0) {
+                    hdr.ethernet.dstAddr = 0x080000001100;   // s11
+                } else {
+                    hdr.ethernet.dstAddr = 0x080000001200;   // s12
+                }
                 hdr.ipv4.setValid();
                 hdr.ipv4.version   = 4;
                 hdr.ipv4.ihl       = 5;
                 hdr.ipv4.protocol  = POLY_IP_PROTOCOL;
-                hdr.ipv4.srcAddr   = 0x0a000101; // 10.0.1.1
-                hdr.ipv4.dstAddr   = 0x0a000202; // 10.0.2.2
                 hdr.ipv4.totalLen  = 78;
                 hdr.ipv4.ttl       = 64;
                 hdr.polyShim.modality_id = 1;
+                if (hdr.polyShim.direction == 0) {
+                    hdr.ipv4.srcAddr = 0x0a000101;
+                    hdr.ipv4.dstAddr = 0x0a000202;
+                } else {
+                    hdr.ipv4.srcAddr = 0x0a000202;
+                    hdr.ipv4.dstAddr = 0x0a000101;
+                }
             } else if (standard_metadata.egress_port == 3) {
-                // 端口 3：外层 IPv6，nextHdr=253
                 hdr.ethernet.etherType = 0x86dd;
-                hdr.ethernet.dstAddr   = 0x080000001200; // s21 的 MAC
+               if (hdr.polyShim.direction == 0) {
+                    hdr.ethernet.dstAddr = 0x080000001200;   // s21
+                } else {
+                    hdr.ethernet.dstAddr = 0x080000002200;   // s22
+                }
                 hdr.ipv6.setValid();
                 hdr.ipv6.version    = 6;
                 hdr.ipv6.nextHdr    = POLY_IP_PROTOCOL;
                 hdr.ipv6.hopLimit   = 64;
                 hdr.ipv6.payLoadLen = 58;
                 hdr.polyShim.modality_id = 2;
+                if (hdr.polyShim.direction == 0) {
+                    hdr.ipv6.srcAddr = 0xfe800000000000000000000000001234;
+                    hdr.ipv6.dstAddr = 0xfe800000000000000000000000005678;
+                } else {
+                    hdr.ipv6.srcAddr = 0xfe800000000000000000000000005678;
+                    hdr.ipv6.dstAddr = 0xfe800000000000000000000000001234;
+                }
             } else if (standard_metadata.egress_port == 4) {
-                // 端口 4：Source Routing，EtherType=0x1234
                 hdr.ethernet.etherType = 0x1234;
                 hdr.polyShim.modality_id = 3;
+                if (hdr.polyShim.direction == 0) {
+                    hdr.srcRoutes[0].setValid();
+                    hdr.srcRoutes[0].bos  = 0;
+                    hdr.srcRoutes[0].port = 2;
+                    hdr.srcRoutes[1].setValid();
+                    hdr.srcRoutes[1].bos  = 0;
+                    hdr.srcRoutes[1].port = 2;
+                    hdr.srcRoutes[2].setValid();
+                    hdr.srcRoutes[2].bos  = 1;
+                    hdr.srcRoutes[2].port = 1;
+                } else {
+                    hdr.srcRoutes[0].setValid();
+                    hdr.srcRoutes[0].bos  = 0;
+                    hdr.srcRoutes[0].port = 1;
+                    hdr.srcRoutes[1].setValid();
+                    hdr.srcRoutes[1].bos  = 0;
+                    hdr.srcRoutes[1].port = 1;
+                    hdr.srcRoutes[2].setValid();
+                    hdr.srcRoutes[2].bos  = 1;
+                    hdr.srcRoutes[2].port = 1;
+                }
             }
         }
     }
@@ -420,18 +695,20 @@ control MyComputeChecksum(inout headers hdr, inout metadata meta) {
     apply {
         update_checksum(
             hdr.ipv4.isValid(),
-            { hdr.ipv4.version,
-              hdr.ipv4.ihl,
-              hdr.ipv4.diffserv,
-              hdr.ipv4.totalLen,
-              hdr.ipv4.identification,
-              hdr.ipv4.flags,
-              hdr.ipv4.fragOffset,
-              hdr.ipv4.ttl,
-              hdr.ipv4.protocol,
-              hdr.ipv4.srcAddr,
-              hdr.ipv4.dstAddr },
+            { hdr.ipv4.version, hdr.ipv4.ihl, hdr.ipv4.diffserv,
+              hdr.ipv4.totalLen, hdr.ipv4.identification,
+              hdr.ipv4.flags, hdr.ipv4.fragOffset, hdr.ipv4.ttl,
+              hdr.ipv4.protocol, hdr.ipv4.srcAddr, hdr.ipv4.dstAddr },
             hdr.ipv4.hdrChecksum,
+            HashAlgorithm.csum16);
+
+        update_checksum(
+            hdr.inner_ipv4.isValid(),
+            { hdr.inner_ipv4.version, hdr.inner_ipv4.ihl, hdr.inner_ipv4.diffserv,
+              hdr.inner_ipv4.totalLen, hdr.inner_ipv4.identification,
+              hdr.inner_ipv4.flags, hdr.inner_ipv4.fragOffset, hdr.inner_ipv4.ttl,
+              hdr.inner_ipv4.protocol, hdr.inner_ipv4.srcAddr, hdr.inner_ipv4.dstAddr },
+            hdr.inner_ipv4.hdrChecksum,
             HashAlgorithm.csum16);
     }
 }

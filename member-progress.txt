@@ -1,0 +1,15 @@
+第三次实验分工
+=====================
+
+组长（成员1）:总体架构设计、裁决状态机方案审核、控制器角色表设计；创建 class3-adjudication 和 class4-final tag；最终 ZIP 打包
+
+组员2:透明还原实现：外层头和 PolyShim setInvalid，恢复内层 IPv4/UDP，重算 checksum；写还原设计说明
+
+组员3:多数判定与重复抑制：候选 CRC、seen_modes、decided、迟到副本处理；写状态机设计说明
+
+组员4:故障注入与控制器改造：--fault corrupt:MODE:SEQ:MASK、--fault drop:MODE:SEQ，装到 s11/s21/s31；写故障设计说明
+
+组员5:计数器读取与自动测试适配：read-counters.py、evaluate-counters.py、run-poly-tests.py；写测试设计说明
+
+组员6:五个场景自动测试执行、证据整理、演示视频制作；写 class3/member-progress.txt、evidence-index.md
+

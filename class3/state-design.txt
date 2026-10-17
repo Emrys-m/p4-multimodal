@@ -1,0 +1,41 @@
+目的网关裁决状态设计
+====================
+
+一、状态存储
+- slot 映射：slot = sequence_number & 1023，共 1024 项状态窗口。
+- seq_tag：记录该 slot 当前保存的序号，用于判断是否为新报文。
+- 同一序号的三份副本共享同一 slot。
+
+二、候选 CRC
+- crc_candidate_1：第一个到达副本的 observed_crc。
+- crc_candidate_2：第二个不同模态副本的 observed_crc。
+- mode_candidate_1、mode_candidate_2：对应模态编号。
+- candidate_counts：已保存的候选数（0/1/2/3）。
+
+三、模态位图与决定标记
+- seen_modes：已参与裁决的 modality_id 位图，防止同模态重复形成第二票。
+- decided：该序号是否已形成多数或已确定无多数。
+- decided_crc：多数胜出的 CRC 值。
+
+四、处理流程
+1. 第一份副本：保存候选，不输出。
+2. 第二份与第一候选一致：形成多数，输出当前副本。
+3. 第二份与第一候选不同：保存第二候选，不输出。
+4. 第三份与某一候选一致：该候选胜出，输出。
+5. 三份都不同：无多数，输出 0 份，no_majority 增加。
+6. 同模态重复：不形成第二票，直接丢弃。
+7. 已 decided 的迟到副本：只更新 good/bad 统计，不再输出。
+
+五、CRC 覆盖字段
+- 内层 IPv4 源/目的地址
+- 传输层协议号
+- UDP/TCP 源/目的端口
+- 16 字节 protected_data
+- 不含 TTL、外层地址等逐跳变化字段
+
+六、透明还原
+- 形成多数后，外层 IPv4/IPv6/SourceRouting 头和 PolyShim setInvalid。
+- 内层 IPv4、UDP/TCP、protected_data setValid。
+- Ethernet EtherType 恢复 0x0800。
+- 重新计算 IPv4 checksum。
+- 从主机侧端口输出。
